@@ -29,6 +29,8 @@
     back: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"/></svg>',
     undo: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>',
     play: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>',
+    wand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M15 4V2m0 14v-2M8 9h2m10 0h2m-4.2 3.8 1.4 1.4M12.2 6.2 10.8 4.8m7 1.4 1.4-1.4M3 21l9-9"/></svg>',
+    lock: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
   };
 
   const $ = (s, root = document) => root.querySelector(s);
@@ -57,7 +59,9 @@
       theme: 'light',
       dir: 'ru', // 'ru' (RU->Foreign, best for exams!), 'foreign' (Foreign->RU), 'mix'
       frGreenOnly: false,
-      frPassedLesson: 5, // Passed up to A2 Lesson 5 (no futur simple until L6!)
+      enAvOnly: false,
+      frPassedLesson: 5, // Passed up to A2 Lesson 5 (strict program barrier!)
+      enPassedLesson: 3, // Passed up to Unit 3
       wakeLock: true,
       selectedUnits: sel,
       srs: {},          // cardId -> { box: 0..4, due: 'YYYY-MM-DD', seen: n }
@@ -67,6 +71,14 @@
       streak: { count: 0, lastDate: '' },
       cheatSub: 'vocab',
       cheatSearch: '',
+      cheatShowFuture: false,
+      builderMode: 'tiles', // 'tiles' | 'input'
+      ai: {
+        preset: 'deepseek',
+        url: 'https://api.deepseek.com/chat/completions',
+        model: 'deepseek-chat',
+        apiKey: '',
+      },
     };
   }
 
@@ -85,6 +97,7 @@
         exams: Array.isArray(parsed.exams) ? parsed.exams : [],
         quizHistory: Array.isArray(parsed.quizHistory) ? parsed.quizHistory : [],
         streak: parsed.streak || def.streak,
+        ai: { ...def.ai, ...(parsed.ai || {}) },
       };
     } catch {
       return def;
@@ -175,12 +188,55 @@
     try { window.AndroidBridge?.setTheme?.(state.theme === 'dark'); } catch {}
   }
 
-  // Current subject helpers
+  // Current subject & STRICT program boundary helpers
   const curData = () => window.STUDY_DATA[state.subject];
-  function activeUnits(subjId = state.subject) {
+
+  function passedLessonFor(subjId = state.subject) {
+    if (subjId === 'fr') return Number(state.frPassedLesson ?? 5);
+    if (subjId === 'en') return Number(state.enPassedLesson ?? 3);
+    return 999;
+  }
+
+  function setPassedLessonFor(subjId, num) {
+    const n = Number(num);
+    if (subjId === 'fr') state.frPassedLesson = n;
+    else if (subjId === 'en') state.enPassedLesson = n;
+    // Clamp selected units strictly within new boundary; if empty, select boundary lesson!
+    const allowed = new Set(allowedUnits(subjId));
+    const curSel = (state.selectedUnits[subjId] || []).filter((id) => allowed.has(id));
+    if (curSel.length) {
+      state.selectedUnits[subjId] = curSel;
+    } else {
+      state.selectedUnits[subjId] = currentBoundaryUnitIds(subjId);
+    }
+    saveState();
+  }
+
+  function isUnitLocked(u, subjId = state.subject) {
     const d = window.STUDY_DATA[subjId];
-    const sel = state.selectedUnits[subjId] || [];
-    return sel.length ? sel : d.units.map((u) => u.id);
+    if (!d || !d.hasProgramBoundary) return false;
+    return typeof u.lessonNum === 'number' && u.lessonNum > passedLessonFor(subjId);
+  }
+
+  function allowedUnits(subjId = state.subject) {
+    const d = window.STUDY_DATA[subjId];
+    if (!d) return [];
+    return d.units.filter((u) => !isUnitLocked(u, subjId)).map((u) => u.id);
+  }
+
+  function currentBoundaryUnitIds(subjId = state.subject) {
+    const d = window.STUDY_DATA[subjId];
+    if (!d) return [];
+    const pl = passedLessonFor(subjId);
+    const exact = d.units.filter((u) => u.lessonNum === pl).map((u) => u.id);
+    return exact.length ? exact : allowedUnits(subjId);
+  }
+
+  function activeUnits(subjId = state.subject) {
+    const allowed = allowedUnits(subjId);
+    const allowSet = new Set(allowed);
+    const sel = (state.selectedUnits[subjId] || []).filter((id) => allowSet.has(id));
+    return sel.length ? sel : currentBoundaryUnitIds(subjId);
   }
 
   function filteredCards(subjId = state.subject) {
@@ -191,15 +247,83 @@
       const greens = arr.filter((c) => c.green);
       if (greens.length) arr = greens;
     }
+    if (subjId === 'en' && state.enAvOnly) {
+      const avs = arr.filter((c) => c.av);
+      if (avs.length) arr = avs;
+    }
     return arr;
   }
 
   function filteredItems(key, subjId = state.subject) {
     const d = window.STUDY_DATA[subjId];
     const list = d[key] || [];
+    const allowSet = new Set(allowedUnits(subjId));
+    const pl = passedLessonFor(subjId);
+    // Step 1: STRICT program boundary filter (future lessons NEVER leak into trainers!)
+    const allowedList = list.filter((x) => {
+      if (typeof x.minLesson === 'number' && x.minLesson > pl) return false;
+      if (x.unit && !allowSet.has(x.unit)) return false;
+      return true;
+    });
+    // Step 2: Prefer active selected units, fallback ONLY to allowedList (never future!)
     const uSet = new Set(activeUnits(subjId));
-    const matched = list.filter((x) => !x.unit || uSet.has(x.unit));
-    return matched.length ? matched : list;
+    const matched = allowedList.filter((x) => !x.unit || uSet.has(x.unit));
+    return matched.length ? matched : allowedList;
+  }
+
+  function boundaryInfo(subjId = state.subject) {
+    const d = window.STUDY_DATA[subjId];
+    if (!d || !d.hasProgramBoundary || !d.lessonBoundaries) return null;
+    const pl = passedLessonFor(subjId);
+    const cur = d.lessonBoundaries.find((b) => b.num === pl) || d.lessonBoundaries[d.lessonBoundaries.length - 1];
+    const lockedCount = d.units.filter((u) => isUnitLocked(u, subjId)).length;
+    return { cur, pl, lockedCount, all: d.lessonBoundaries };
+  }
+
+  function hasAiKey() {
+    return !!(state.ai && state.ai.apiKey && state.ai.apiKey.trim().length > 6);
+  }
+
+  // Safe rich renderer for full grammar rules (bold + Markdown tables + clean paragraphs)
+  function renderRuleBody(body) {
+    const lines = String(body || '').split('\n');
+    const out = [];
+    let i = 0;
+    const inlineFmt = (s) => esc(s)
+      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    while (i < lines.length) {
+      const ln = lines[i].trim();
+      if (!ln) { i++; continue; }
+      if (ln.startsWith('|')) {
+        const tblLines = [];
+        while (i < lines.length && lines[i].trim().startsWith('|')) {
+          tblLines.push(lines[i].trim());
+          i++;
+        }
+        const rows = tblLines
+          .filter((r) => !/^\|[\s\-:|]+\|$/.test(r))
+          .map((r) => r.replace(/^\||\|$/g, '').split('|').map((c) => c.trim()));
+        if (rows.length) {
+          const head = rows[0];
+          const bodyRows = rows.slice(1);
+          out.push(
+            `<div class="rule-tbl-wrap"><table class="rule-tbl"><thead><tr>${head.map((c) => `<th>${inlineFmt(c)}</th>`).join('')}</tr></thead>` +
+            (bodyRows.length ? `<tbody>${bodyRows.map((r) => `<tr>${r.map((c) => `<td>${inlineFmt(c)}</td>`).join('')}</tr>`).join('')}</tbody>` : '') +
+            `</table></div>`
+          );
+        }
+        continue;
+      }
+      const pLines = [];
+      while (i < lines.length && lines[i].trim() && !lines[i].trim().startsWith('|')) {
+        pLines.push(inlineFmt(lines[i]));
+        i++;
+      }
+      if (pLines.length) out.push(`<p>${pLines.join('\n')}</p>`);
+    }
+    return `<div class="rule-rich">${out.join('')}</div>`;
   }
 
   // SRS helper (simple transparent intervals: box 0=today, 1=1d, 2=3d, 3=7d, 4=14d, 5=30d)
@@ -370,11 +494,14 @@
     let specialModesHtml = '';
     if (state.subject === 'fr') {
       const availVerbs = d.conjugations.filter((v) => v.minLesson <= state.frPassedLesson).length;
+      const availTexts = (d.texts || []).filter((t) => (t.minLesson || 1) <= state.frPassedLesson).length;
       const tensesList = state.frPassedLesson >= 10
         ? 'présent, PC, imparfait, impératif, futur, subjonctif'
         : state.frPassedLesson >= 6
           ? 'présent, PC, imparfait, impératif, futur simple'
-          : 'présent, PC, imparfait, impératif (до L5)';
+          : state.frPassedLesson === 0
+            ? 'présent, impératif (уровень A1)'
+            : `présent, PC, imparfait, impératif (до L${state.frPassedLesson})`;
       specialModesHtml = `
         <button type="button" class="mode-row" data-mode="conjugation">
           <div class="mode-icon accent">${ICO.grid}</div>
@@ -384,14 +511,15 @@
           </div>
           <div class="mode-right">${availVerbs} гл. ${ICO.chev}</div>
         </button>
+        ${availTexts ? `
         <button type="button" class="mode-row" data-mode="fr_texts">
           <div class="mode-icon good">${ICO.list}</div>
           <div class="mode-body">
             <div class="mode-title">Тексты и активные слова</div>
-            <div class="mode-desc">Тезисы текста + чек-лист зелёных слов</div>
+            <div class="mode-desc">Тезисы пройденных текстов + чек-лист зелёных слов</div>
           </div>
-          <div class="mode-right">${d.texts.length} ${ICO.chev}</div>
-        </button>`;
+          <div class="mode-right">${availTexts} ${ICO.chev}</div>
+        </button>` : ''}`;
     } else if (state.subject === 'econ') {
       specialModesHtml = `
         <button type="button" class="mode-row" data-mode="econ_maps">
@@ -415,18 +543,57 @@
     }
     // Note: Home Reading intentionally has NO retelling plan per user request!
 
+    // Program Boundary Banner (FR & General EN)
+    const bInfo = boundaryInfo();
+    const boundaryHtml = bInfo ? `
+      <div class="boundary-bar">
+        <div class="boundary-left">
+          <div class="boundary-kicker">Программа вуза · где я сейчас</div>
+          <div class="boundary-val">${esc(bInfo.cur.label)}${bInfo.lockedCount ? ` · 🔒 ${bInfo.lockedCount} на будущее` : ' · всё открыто'}</div>
+          <div class="boundary-sub">${esc(bInfo.cur.desc)}</div>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="changeBoundaryBtn">Сдвинуть</button>
+      </div>
+    ` : '';
+
+    // Hybrid Sentence Builder card (FR & General EN)
+    const builderTopics = window.BuilderEngine ? window.BuilderEngine.getTopics(state.subject, passedLessonFor()) : [];
+    const builderModeHtml = builderTopics.length ? `
+      <button type="button" class="mode-row" data-mode="builder">
+        <div class="mode-icon accent">${ICO.wand}</div>
+        <div class="mode-body">
+          <div class="mode-title">Конструктор предложений ${hasAiKey() ? '<span class="ai-pill" style="padding:1px 7px;font-size:10.5px;margin-left:4px">✨ ИИ</span>' : ''}</div>
+          <div class="mode-desc">Плитки и ввод строго до ${bInfo ? esc(bInfo.cur.label) : 'текущего урока'} · офлайн${hasAiKey() ? ' + онлайн ИИ' : ' (+ опция ИИ)'}</div>
+        </div>
+        <div class="mode-right">${builderTopics.length} тем ${ICO.chev}</div>
+      </button>
+    ` : '';
+
+    const curBoundIds = currentBoundaryUnitIds();
+    const allowIds = allowedUnits();
+    const isCurPreset = selU.length === curBoundIds.length && curBoundIds.every((id) => selU.includes(id));
+    const isAllPassedPreset = selU.length === allowIds.length && allowIds.every((id) => selU.includes(id));
+
     root.innerHTML = `
+      ${boundaryHtml}
+
       <!-- Unit Filter Card -->
       <div class="card card-compact">
         <div class="filter-row">
           <div class="filter-summary">
-            <div class="filter-title">Выбранные темы: ${esc(labelPreview)}</div>
+            <div class="filter-title">Темы тренировки: ${esc(labelPreview)}</div>
             <div class="filter-sub">${cards.length} карт. · ${exs.length} упр. · ${colls.length} колл.</div>
           </div>
           <button type="button" class="btn btn-secondary btn-sm" id="pickUnitsBtn">Выбрать</button>
         </div>
+        ${bInfo ? `
+        <div class="chip-row">
+          <button type="button" class="pill${isCurPreset ? ' active' : ''}" id="presetCurBtn">Только ${esc(bInfo.cur.label)}</button>
+          <button type="button" class="pill${isAllPassedPreset ? ' active' : ''}" id="presetPassedBtn">Всё пройденное</button>
+        </div>` : ''}
         <div class="chip-row">
           ${state.subject === 'fr' ? `<button type="button" class="pill${state.frGreenOnly ? ' green-active' : ''}" id="greenToggle">Только зелёные</button>` : ''}
+          ${state.subject === 'en' ? `<button type="button" class="pill${state.enAvOnly ? ' green-active' : ''}" id="enAvToggle">Только AV</button>` : ''}
           <button type="button" class="pill" id="dirToggle">${state.dir === 'ru' ? 'RU → ' + d.langLabel : state.dir === 'foreign' ? d.langLabel + ' → RU' : 'Вперемешку'}</button>
           ${mistakes.length ? `<button type="button" class="pill bad" id="mistakesBtn">Ошибки · ${mistakes.length}</button>` : ''}
         </div>
@@ -450,6 +617,8 @@
       <div class="section-label">Режимы подготовки</div>
 
       <div class="mode-list">
+        ${builderModeHtml}
+
         <button type="button" class="mode-row" data-mode="cards">
           <div class="mode-icon accent">${ICO.cards}</div>
           <div class="mode-body">
@@ -510,10 +679,30 @@
       ${d.note ? `<div class="note-strip">${esc(d.note)}</div>` : ''}
     `;
 
+    const cb = $('#changeBoundaryBtn');
+    if (cb) cb.onclick = openBoundaryModal;
+    const pCur = $('#presetCurBtn');
+    if (pCur) pCur.onclick = () => {
+      state.selectedUnits[state.subject] = currentBoundaryUnitIds();
+      saveState();
+      renderLearnTab(root);
+    };
+    const pAll = $('#presetPassedBtn');
+    if (pAll) pAll.onclick = () => {
+      state.selectedUnits[state.subject] = allowedUnits();
+      saveState();
+      renderLearnTab(root);
+    };
     $('#pickUnitsBtn').onclick = openUnitPicker;
     const gt = $('#greenToggle');
     if (gt) gt.onclick = () => {
       state.frGreenOnly = !state.frGreenOnly;
+      saveState();
+      renderLearnTab(root);
+    };
+    const eat = $('#enAvToggle');
+    if (eat) eat.onclick = () => {
+      state.enAvOnly = !state.enAvOnly;
       saveState();
       renderLearnTab(root);
     };
@@ -531,7 +720,8 @@
     root.querySelectorAll('.mode-row').forEach((btn) => {
       btn.onclick = () => {
         const m = btn.dataset.mode;
-        if (m === 'cards') startCardsSession();
+        if (m === 'builder') startBuilderSession();
+        else if (m === 'cards') startCardsSession();
         else if (m === 'dictation') startDictationSession();
         else if (m === 'collocations') startCollocationSession();
         else if (m === 'tricky') startTrickySession();
@@ -546,10 +736,56 @@
   }
 
   // ============================================================================
-  // UNIT PICKER MODAL
+  // PROGRAM BOUNDARY MODAL (WHERE AM I IN THE SYLLABUS?)
+  // ============================================================================
+  function openBoundaryModal() {
+    const d = curData();
+    const bInfo = boundaryInfo();
+    if (!bInfo) return;
+
+    openModal(`
+      <div class="modal-head">
+        <h3 class="modal-title">Где я сейчас · ${esc(d.shortName)}</h3>
+        <button type="button" class="btn btn-secondary btn-sm" id="closeMod">Закрыть</button>
+      </div>
+      <div class="small muted">Выбери последний урок, который вы уже проходите в вузе. Всё, что дальше, останется в Шпаргалке «на будущее», но <b>никогда</b> не попадёт в карточки, конструктор, спряжения и срез.</div>
+      <div class="mode-list">
+        ${bInfo.all.map((b) => {
+          const isCur = b.num === bInfo.pl;
+          const isFuture = b.num > bInfo.pl;
+          return `
+            <button type="button" class="mode-row" data-bnum="${b.num}" style="${isCur ? 'border-color:var(--accent);background:color-mix(in srgb, var(--accent) 8%, var(--surface))' : ''}">
+              <div class="mode-body">
+                <div class="mode-title">${esc(b.label)} ${isCur ? '<span class="pill active" style="padding:1px 8px;min-height:20px;font-size:11px;margin-left:4px">Сейчас</span>' : isFuture ? '<span class="badge-future" style="margin-left:4px">На будущее</span>' : ''}</div>
+                <div class="mode-desc">${esc(b.desc)}</div>
+              </div>
+            </button>
+          `;
+        }).join('')}
+      </div>
+    `);
+    $('#closeMod').onclick = closeModal;
+    $('#modalSheet').querySelectorAll('[data-bnum]').forEach((btn) => {
+      btn.onclick = () => {
+        const n = Number(btn.dataset.bnum);
+        setPassedLessonFor(state.subject, n);
+        // Also switch active selection cleanly to the new current lesson
+        state.selectedUnits[state.subject] = currentBoundaryUnitIds(state.subject);
+        saveState();
+        closeModal();
+        renderAll();
+        const picked = bInfo.all.find((x) => x.num === n);
+        showToast(`Граница программы: ${picked ? picked.label : n}`);
+      };
+    });
+  }
+
+  // ============================================================================
+  // UNIT PICKER MODAL (RESPECTS PROGRAM BOUNDARY!)
   // ============================================================================
   function openUnitPicker() {
     const d = curData();
+    const bInfo = boundaryInfo();
     const sel = new Set(activeUnits());
     const groups = {};
     d.units.forEach((u) => {
@@ -562,16 +798,19 @@
         <div>
           <div class="section-label" style="margin-bottom:8px">${esc(grp)}</div>
           <div class="chip-row" style="margin-top:0">
-            ${list.map((u) => `
-              <button type="button" class="pill${sel.has(u.id) ? ' active' : ''}" data-uid="${u.id}">
-                ${esc(u.label)}
-              </button>
-            `).join('')}
+            ${list.map((u) => {
+              const locked = isUnitLocked(u);
+              return `
+                <button type="button" class="pill${locked ? ' locked' : sel.has(u.id) ? ' active' : ''}" data-uid="${u.id}" data-locked="${locked ? '1' : '0'}">
+                  ${locked ? '🔒 ' : ''}${esc(u.label)}
+                </button>
+              `;
+            }).join('')}
           </div>
         </div>
       `).join('');
 
-      const presetFr = state.subject === 'fr'
+      const presetFr = state.subject === 'fr' && state.frPassedLesson > 0
         ? `<button type="button" class="btn btn-secondary btn-sm" id="presetA2Passed">Пройденное A2 (L1–L${state.frPassedLesson})</button>`
         : '';
 
@@ -580,8 +819,9 @@
           <h3 class="modal-title">Выбор уроков · ${esc(d.shortName)}</h3>
           <button type="button" class="btn btn-secondary btn-sm" id="closeMod">Готово</button>
         </div>
+        ${bInfo && bInfo.lockedCount ? `<div class="small muted">🔒 Будущие уроки (после ${esc(bInfo.cur.label)}) скрыты от тренажёров. <button type="button" class="pill soft-accent" id="jumpBoundBtn" style="padding:2px 8px;min-height:24px;font-size:11.5px;margin-left:4px">Сдвинуть границу</button></div>` : ''}
         <div class="row-gap">
-          <button type="button" class="btn btn-secondary btn-sm" id="selAll">Выбрать всё</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="selAll">${bInfo ? 'Всё пройденное' : 'Выбрать всё'}</button>
           <button type="button" class="btn btn-secondary btn-sm" id="selNone">Снять всё</button>
           ${presetFr}
         </div>
@@ -589,14 +829,21 @@
         <button type="button" class="btn btn-primary btn-block" id="applyUnits">Применить (${sel.size})</button>
       `);
 
+      const jb = $('#jumpBoundBtn');
+      if (jb) jb.onclick = () => { closeModal(true); openBoundaryModal(); };
+
       $('#modalSheet').querySelectorAll('[data-uid]').forEach((b) => {
         b.onclick = () => {
+          if (b.dataset.locked === '1') {
+            showToast(`Урок пока скрыт границей (${bInfo ? bInfo.cur.label : ''}). Нажми «Сдвинуть границу»`);
+            return;
+          }
           const id = b.dataset.uid;
           if (sel.has(id)) sel.delete(id); else sel.add(id);
           draw();
         };
       });
-      $('#selAll').onclick = () => { d.units.forEach((u) => sel.add(u.id)); draw(); };
+      $('#selAll').onclick = () => { allowedUnits().forEach((id) => sel.add(id)); draw(); };
       $('#selNone').onclick = () => { sel.clear(); draw(); };
       const pa = $('#presetA2Passed');
       if (pa) pa.onclick = () => {
@@ -635,45 +882,102 @@
     let content = '';
     if (state.cheatSub === 'vocab') {
       const q = (state.cheatSearch || '').toLowerCase().trim();
+      const allowSet = new Set(allowedUnits());
       let cards = filteredCards();
       if (q) {
-        cards = d.cards.filter((c) =>
-          c.term.toLowerCase().includes(q) || c.ru.toLowerCase().includes(q) || (c.coll && c.coll.toLowerCase().includes(q))
-        );
+        cards = d.cards.filter((c) => {
+          if (!state.cheatShowFuture && !allowSet.has(c.unit)) return false;
+          if (state.subject === 'fr' && state.frGreenOnly && !c.green) return false;
+          if (state.subject === 'en' && state.enAvOnly && !c.av) return false;
+          return c.term.toLowerCase().includes(q) || c.ru.toLowerCase().includes(q) || (c.coll && c.coll.toLowerCase().includes(q));
+        });
       }
       const shown = cards.slice(0, 80);
       content = `
         <div class="search-wrap">
           <input type="search" class="search-input" id="cheatSearch" placeholder="Поиск слова на ${d.langLabel} или русском..." value="${esc(state.cheatSearch)}">
         </div>
-        <div class="row-between small muted">
+        <div class="row-between small muted" style="flex-wrap:wrap;gap:6px">
           <span>Найдено: ${cards.length}${cards.length > 80 ? ' (показаны первые 80)' : ''}</span>
-          ${state.subject === 'fr' ? `<button type="button" class="pill${state.frGreenOnly ? ' green-active' : ''}" id="cheatGreen">Только зелёные</button>` : ''}
+          <div class="row-gap" style="gap:6px">
+            ${state.subject === 'fr' ? `<button type="button" class="pill${state.frGreenOnly ? ' green-active' : ''}" id="cheatGreen">Только зелёные</button>` : ''}
+            ${state.subject === 'en' ? `<button type="button" class="pill${state.enAvOnly ? ' green-active' : ''}" id="cheatEnAv">Только AV</button>` : ''}
+            ${d.hasProgramBoundary ? `<button type="button" class="pill${state.cheatShowFuture ? ' warn' : ''}" id="cheatFutureToggle">${state.cheatShowFuture ? '🔒 С будущими' : 'Только пройденное'}</button>` : ''}
+          </div>
         </div>
         <div class="mode-list">
-          ${shown.map((c) => `
+          ${shown.map((c) => {
+            const isFut = !allowSet.has(c.unit);
+            return `
             <div class="dict-item">
               <div style="min-width:0">
-                <div class="dict-term">${esc(c.term)} ${c.green ? '<span class="pill green-active" style="padding:1px 7px;min-height:20px;font-size:11px">зелёное</span>' : ''}</div>
+                <div class="dict-term">${esc(c.term)} ${c.green ? '<span class="pill green-active" style="padding:1px 7px;min-height:20px;font-size:11px">зелёное</span>' : ''} ${c.av ? '<span class="pill soft-accent" style="padding:1px 7px;min-height:20px;font-size:11px">AV</span>' : ''} ${isFut ? '<span class="badge-future">🔒 будущее</span>' : ''}</div>
                 <div class="dict-ru">${esc(c.ru)}</div>
                 ${c.coll ? `<div class="dict-meta"><b>Колл.:</b> ${esc(c.coll)}</div>` : ''}
                 ${c.ex ? `<div class="dict-meta">${esc(c.ex)}</div>` : ''}
               </div>
               <button type="button" class="tts-btn" data-say="${esc(c.term)}" aria-label="Произнести">${ICO.vol}</button>
-            </div>
-          `).join('')}
+            </div>`;
+          }).join('')}
         </div>
       `;
     } else if (state.cheatSub === 'grammar') {
-      const sheets = filteredItems('cheatsheets');
-      content = sheets.map((sh, idx) => `
-        <details class="accordion"${idx === 0 ? ' open' : ''}>
-          <summary><span>${esc(sh.title)}</span>${ICO.chev}</summary>
+      const q = (state.cheatSearch || '').toLowerCase().trim();
+      const pl = passedLessonFor();
+      const allowSet = new Set(allowedUnits());
+      const selSet = new Set(activeUnits());
+      const allSheets = d.cheatsheets || [];
+
+      const matchSheet = (sh) => {
+        if (!q) return sh;
+        const blocks = sh.blocks.filter((b) =>
+          b.heading.toLowerCase().includes(q) || b.body.toLowerCase().includes(q) || sh.title.toLowerCase().includes(q)
+        );
+        return blocks.length ? { ...sh, blocks } : null;
+      };
+
+      const passedSheets = [];
+      const futureSheets = [];
+      allSheets.forEach((sh) => {
+        const isFut = (typeof sh.minLesson === 'number' && sh.minLesson > pl) || (sh.unit && !allowSet.has(sh.unit));
+        const m = matchSheet(sh);
+        if (!m) return;
+        if (isFut) futureSheets.push(m);
+        else passedSheets.push(m);
+      });
+
+      // Put currently active units first so current lesson is immediately open at the top!
+      passedSheets.sort((a, b) => (selSet.has(b.unit) ? 1 : 0) - (selSet.has(a.unit) ? 1 : 0));
+
+      const renderSheetCard = (sh, idx, isFut) => `
+        <details class="accordion"${(!isFut && (idx === 0 || !!q)) || (isFut && !!q) ? ' open' : ''}>
+          <summary>
+            <span>${esc(sh.title)} ${isFut ? '<span class="badge-future" style="margin-left:6px">🔒 На будущее</span>' : ''}</span>
+            ${ICO.chev}
+          </summary>
           <div class="accordion-body">
-            ${sh.blocks.map((b) => `<div class="rule-block"><h4>${esc(b.heading)}</h4><p>${esc(b.body)}</p></div>`).join('')}
+            ${sh.blocks.map((b) => `
+              <div class="rule-block">
+                <h4>${esc(b.heading)}</h4>
+                ${renderRuleBody(b.body)}
+                ${!isFut && b.builderTopic && window.BuilderEngine ? `<button type="button" class="rule-practice-btn" data-practice-topic="${esc(b.builderTopic)}">⚡ Отработать это правило</button>` : ''}
+              </div>
+            `).join('')}
           </div>
         </details>
-      `).join('');
+      `;
+
+      content = `
+        <div class="search-wrap">
+          <input type="search" class="search-input" id="cheatSearch" placeholder="Поиск по правилам (qui, gérondif, gerund, complex subject...)" value="${esc(state.cheatSearch)}">
+        </div>
+        <div class="small muted">Пройденные разделы: ${passedSheets.length}${futureSheets.length ? ` · На будущее 🔒: ${futureSheets.length}` : ''}</div>
+        ${passedSheets.map((sh, idx) => renderSheetCard(sh, idx, false)).join('')}
+        ${futureSheets.length ? `
+          <div class="section-label" style="margin-top:6px">🔒 На будущее (пока не попадают в тренажёры)</div>
+          ${futureSheets.map((sh, idx) => renderSheetCard(sh, idx, true)).join('')}
+        ` : ''}
+      `;
     } else if (state.cheatSub === 'conj' && state.subject === 'fr') {
       const q = (state.cheatSearch || '').toLowerCase().trim();
       const verbs = d.conjugations.filter((v) => !q || v.inf.toLowerCase().includes(q) || v.ru.toLowerCase().includes(q) || v.similar.toLowerCase().includes(q));
@@ -754,6 +1058,14 @@
 
     const cg = $('#cheatGreen');
     if (cg) cg.onclick = () => { state.frGreenOnly = !state.frGreenOnly; saveState(); renderCheatTab(root); };
+    const cea = $('#cheatEnAv');
+    if (cea) cea.onclick = () => { state.enAvOnly = !state.enAvOnly; saveState(); renderCheatTab(root); };
+    const cft = $('#cheatFutureToggle');
+    if (cft) cft.onclick = () => { state.cheatShowFuture = !state.cheatShowFuture; saveState(); renderCheatTab(root); };
+
+    root.querySelectorAll('[data-practice-topic]').forEach((b) => {
+      b.onclick = () => startBuilderSession({ topicId: b.dataset.practiceTopic });
+    });
 
     const om = $('#openMapsBtn');
     if (om) om.onclick = startEconMapsSession;
@@ -914,6 +1226,9 @@
   // SETTINGS MODAL (Gear Icon)
   // ============================================================================
   function openSettingsModal() {
+    const presets = window.BuilderEngine ? window.BuilderEngine.AI_PRESETS : {};
+    const ai = state.ai || { preset: 'deepseek', url: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat', apiKey: '' };
+
     openModal(`
       <div class="modal-head">
         <h3 class="modal-title">Настройки</h3>
@@ -923,11 +1238,22 @@
       <div>
         <div class="setting-row">
           <div>
-            <b>Французский: пройденный урок A2</b>
-            <div class="small muted">Фильтрует времена в спряжениях (до L5 без futur simple)</div>
+            <b>Французский: где я сейчас</b>
+            <div class="small muted">Скрывает непройденные уроки и времена из тренажёров</div>
           </div>
-          <select class="input-field" id="setFrLesson" style="width:92px;padding:8px">
+          <select class="input-field" id="setFrLesson" style="width:108px;padding:8px">
+            <option value="0"${state.frPassedLesson === 0 ? ' selected' : ''}>Весь A1</option>
             ${[1,2,3,4,5,6,7,8,9,10].map((n) => `<option value="${n}"${state.frPassedLesson === n ? ' selected' : ''}>A2 L${n}</option>`).join('')}
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <b>General EN: где я сейчас</b>
+            <div class="small muted">Граница пройденных юнитов Winning Strategy</div>
+          </div>
+          <select class="input-field" id="setEnLesson" style="width:108px;padding:8px">
+            ${[1,2,3].map((n) => `<option value="${n}"${state.enPassedLesson === n ? ' selected' : ''}>Unit ${n}</option>`).join('')}
           </select>
         </div>
 
@@ -939,10 +1265,39 @@
           <button type="button" class="pill${state.wakeLock ? ' active' : ''}" id="setWake">${state.wakeLock ? 'Вкл' : 'Выкл'}</button>
         </div>
 
+        <!-- Hybrid AI Tutor Config -->
+        <div class="ai-box" style="margin:10px 0">
+          <div class="row-between">
+            <b>✨ ИИ-репетитор (Гибрид, опционально)</b>
+            <span class="pill ${hasAiKey() ? 'green-active' : ''}" style="min-height:22px;padding:2px 8px;font-size:11px">${hasAiKey() ? 'Подключён' : 'Офлайн'}</span>
+          </div>
+          <div class="small muted">Без ключа всё работает 100% офлайн. С ключом открываются живые фразы от ИИ и умная проверка свободного перевода. Ключ хранится только на телефоне и не попадает в JSON-бэкап.</div>
+          <label class="small muted">Провайдер
+            <select class="input-field" id="aiPreset" style="margin-top:4px;padding:8px">
+              ${Object.entries(presets).map(([k, v]) => `<option value="${k}"${ai.preset === k ? ' selected' : ''}>${esc(v.name)}</option>`).join('')}
+            </select>
+          </label>
+          <label class="small muted">API URL
+            <input type="text" class="input-field" id="aiUrl" style="margin-top:4px;padding:8px;font-size:13px" value="${esc(ai.url)}">
+          </label>
+          <label class="small muted">Модель
+            <input type="text" class="input-field" id="aiModel" style="margin-top:4px;padding:8px;font-size:13px" value="${esc(ai.model)}">
+          </label>
+          <label class="small muted">API-ключ
+            <input type="password" class="input-field" id="aiKey" style="margin-top:4px;padding:8px;font-size:13px" placeholder="sk-..." value="${esc(ai.apiKey || '')}">
+          </label>
+          <div class="row-gap">
+            <button type="button" class="btn btn-primary btn-sm" id="saveAiBtn">Сохранить</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="testAiBtn">Проверить связь</button>
+            ${hasAiKey() ? '<button type="button" class="btn btn-outline btn-sm" id="clearAiBtn">Удалить ключ</button>' : ''}
+          </div>
+          <div class="small muted" id="aiStatusLine"></div>
+        </div>
+
         <div class="setting-row">
           <div>
             <b>Бэкап прогресса (JSON)</b>
-            <div class="small muted">Сохранить или восстановить все данные</div>
+            <div class="small muted">Сохранить или восстановить прогресс (без API-ключа)</div>
           </div>
           <div class="row-gap">
             <button type="button" class="btn btn-secondary btn-sm" id="exportBtn">Экспорт</button>
@@ -963,18 +1318,64 @@
 
     $('#closeMod').onclick = closeModal;
     $('#setFrLesson').onchange = (e) => {
-      state.frPassedLesson = Number(e.target.value);
-      saveState();
+      setPassedLessonFor('fr', Number(e.target.value));
       renderAll();
-      showToast(`Французский: до A2 L${state.frPassedLesson}`);
+      showToast(`Французский: до ${state.frPassedLesson === 0 ? 'A1' : 'A2 L' + state.frPassedLesson}`);
+    };
+    $('#setEnLesson').onchange = (e) => {
+      setPassedLessonFor('en', Number(e.target.value));
+      renderAll();
+      showToast(`General EN: до Unit ${state.enPassedLesson}`);
     };
     $('#setWake').onclick = () => {
       state.wakeLock = !state.wakeLock;
       saveState();
       openSettingsModal();
     };
+    $('#aiPreset').onchange = (e) => {
+      const p = presets[e.target.value];
+      if (p) {
+        $('#aiUrl').value = p.url;
+        $('#aiModel').value = p.model;
+      }
+    };
+    const readAiForm = () => ({
+      preset: $('#aiPreset').value,
+      url: $('#aiUrl').value.trim(),
+      model: $('#aiModel').value.trim(),
+      apiKey: $('#aiKey').value.trim(),
+    });
+    $('#saveAiBtn').onclick = () => {
+      state.ai = readAiForm();
+      saveState();
+      renderAll();
+      showToast(hasAiKey() ? 'ИИ-репетитор подключён' : 'Настройки сохранены (офлайн)');
+      openSettingsModal();
+    };
+    $('#testAiBtn').onclick = async () => {
+      const cfg = readAiForm();
+      state.ai = cfg;
+      saveState();
+      const stEl = $('#aiStatusLine');
+      stEl.textContent = 'Проверяю подключение…';
+      try {
+        const reply = await window.BuilderEngine.testConnection(cfg);
+        stEl.innerHTML = `<span style="color:var(--good)"><b>Связь есть!</b> Ответ: ${esc(reply)}</span>`;
+      } catch (err) {
+        stEl.innerHTML = `<span style="color:var(--bad)">${esc(err.message || String(err))}</span>`;
+      }
+    };
+    const clAi = $('#clearAiBtn');
+    if (clAi) clAi.onclick = () => {
+      state.ai.apiKey = '';
+      saveState();
+      renderAll();
+      showToast('API-ключ удалён');
+      openSettingsModal();
+    };
     $('#exportBtn').onclick = () => {
-      const json = JSON.stringify(state, null, 2);
+      const safeState = { ...state, ai: { ...state.ai, apiKey: '' } };
+      const json = JSON.stringify(safeState, null, 2);
       const fname = `linguaprep-backup-${todayStr()}.json`;
       if (window.AndroidBridge && typeof window.AndroidBridge.saveBackup === 'function') {
         window.AndroidBridge.saveBackup(json, fname);
@@ -2155,8 +2556,13 @@
   // SPECIAL MODULE (FR ONLY — NOT HR!): FRENCH TEXTS & GREEN WORDS CHECKLIST
   // ============================================================================
   function startFrTextsSession() {
-    const texts = window.STUDY_DATA.fr.texts || [];
-    const defaultIdx = Math.max(0, texts.findIndex((t) => t.unit === 'a2-5'));
+    const texts = (window.STUDY_DATA.fr.texts || []).filter((t) => (t.minLesson || 1) <= state.frPassedLesson);
+    if (!texts.length) {
+      showToast('Тексты A2 откроются с границы A2 L1');
+      return;
+    }
+    const curU = `a2-${state.frPassedLesson}`;
+    const defaultIdx = Math.max(0, texts.findIndex((t) => t.unit === curU));
     openSession({
       type: 'fr_texts',
       title: 'Тексты FR',
@@ -2166,7 +2572,7 @@
   }
 
   function renderFrTextsSession(ov) {
-    const texts = window.STUDY_DATA.fr.texts || [];
+    const texts = (window.STUDY_DATA.fr.texts || []).filter((t) => (t.minLesson || 1) <= state.frPassedLesson);
     const t = texts[session.idx] || texts[0];
     const checked = session.checkedWords[t.id] || {};
     const usedCnt = Object.values(checked).filter(Boolean).length;
@@ -2519,6 +2925,483 @@
     $('#sumExitBtn').onclick = () => closeSession();
   }
 
+  // ============================================================================
+  // HYBRID SENTENCE BUILDER (OFFLINE PARAMETRIC + OPTIONAL ONLINE AI)
+  // ============================================================================
+  function getBuilderTargetWords(focusMode, customWords) {
+    if (focusMode === 'custom') return customWords || [];
+    if (focusMode === 'green') {
+      const cards = filteredCards();
+      const filtered = state.subject === 'fr' ? cards.filter((c) => c.green) : cards.filter((c) => c.av);
+      return shuffle(filtered).slice(0, 12).map((c) => c.term.replace(/\([^)]*\)/g, '').trim());
+    }
+    if (focusMode === 'mistakes') {
+      const ms = state.mistakes[state.subject] || [];
+      return ms.slice(0, 12).map((m) => String(m.answer || '').replace(/\([^)]*\)/g, '').trim()).filter(Boolean);
+    }
+    return [];
+  }
+
+  function prepareTileBank(item) {
+    const all = [...(item.tokens || []), ...(item.distractors || [])];
+    return shuffle(all.map((text, idx) => ({ id: idx, text })));
+  }
+
+  function startBuilderSession(opts = {}) {
+    const subj = state.subject;
+    const pl = passedLessonFor(subj);
+    const topics = window.BuilderEngine ? window.BuilderEngine.getTopics(subj, pl) : [];
+    if (!topics.length) {
+      showToast('Конструктор доступен для Французского и General EN');
+      return;
+    }
+    const topicId = opts.topicId || '';
+    const focusMode = opts.focusMode || 'all';
+    const customWords = opts.customWords || [];
+    const targetWords = getBuilderTargetWords(focusMode, customWords);
+    const queue = window.BuilderEngine.generateOffline({
+      subject: subj,
+      passedLesson: pl,
+      units: activeUnits(subj),
+      topicId,
+      focusMode,
+      targetWords,
+      cardsPool: filteredCards(subj),
+      count: 8,
+    });
+    if (!queue.length) {
+      showToast('Нет шаблонов для выбранных параметров');
+      return;
+    }
+    openSession({
+      type: 'builder',
+      title: 'Конструктор',
+      subject: subj,
+      mode: state.builderMode || 'tiles', // 'tiles' | 'input'
+      topicId,
+      focusMode,
+      customWords,
+      queue,
+      i: 0,
+      ok: 0,
+      miss: [],
+      placed: [],
+      bank: prepareTileBank(queue[0]),
+      checked: false,
+      isCorrect: false,
+      userText: '',
+      aiBusy: false,
+      aiFeedback: null,
+    });
+  }
+
+  function reloadBuilderQueue(customQueue = null) {
+    if (!session || session.type !== 'builder') return;
+    const pl = passedLessonFor(session.subject);
+    const targetWords = getBuilderTargetWords(session.focusMode, session.customWords);
+    const q = customQueue || window.BuilderEngine.generateOffline({
+      subject: session.subject,
+      passedLesson: pl,
+      units: activeUnits(session.subject),
+      topicId: session.topicId,
+      focusMode: session.focusMode,
+      targetWords,
+      cardsPool: filteredCards(session.subject),
+      count: 8,
+    });
+    if (!q.length) {
+      showToast('Не нашлось фраз под фильтр');
+      return;
+    }
+    session.queue = q;
+    session.i = 0;
+    session.ok = 0;
+    session.miss = [];
+    session.placed = [];
+    session.bank = prepareTileBank(q[0]);
+    session.checked = false;
+    session.isCorrect = false;
+    session.userText = '';
+    session.aiFeedback = null;
+    renderSession();
+  }
+
+  function openBuilderWordsModal() {
+    if (!session || session.type !== 'builder') return;
+    const d = window.STUDY_DATA[session.subject];
+    const cards = filteredCards(session.subject);
+    let focus = session.focusMode;
+    let picked = new Set(session.customWords || []);
+    let qSearch = '';
+
+    function draw() {
+      const q = qSearch.toLowerCase().trim();
+      const shown = cards.filter((c) => !q || c.term.toLowerCase().includes(q) || c.ru.toLowerCase().includes(q)).slice(0, 60);
+      openModal(`
+        <div class="modal-head">
+          <h3 class="modal-title">Фокус слов · Конструктор</h3>
+          <button type="button" class="btn btn-secondary btn-sm" id="closeMod">Готово</button>
+        </div>
+        <div class="chip-row" style="margin-top:0">
+          <button type="button" class="pill${focus === 'all' ? ' active' : ''}" data-fm="all">Все пройденные</button>
+          <button type="button" class="pill${focus === 'green' ? ' green-active' : ''}" data-fm="green">${session.subject === 'fr' ? 'Только зелёные' : 'Только AV'}</button>
+          <button type="button" class="pill${focus === 'mistakes' ? ' bad' : ''}" data-fm="mistakes">Из ошибок (${(state.mistakes[session.subject] || []).length})</button>
+          <button type="button" class="pill${focus === 'custom' ? ' active' : ''}" data-fm="custom">Свои слова (${picked.size})</button>
+        </div>
+        ${focus === 'custom' ? `
+          <input type="search" class="search-input" id="bwSearch" placeholder="Найти слово из пройденных уроков..." value="${esc(qSearch)}">
+          <div class="small muted">Выбери до 10 слов (выбрано: ${picked.size}):</div>
+          <div class="word-pick-list">
+            ${shown.map((c) => {
+              const cleanT = c.term.replace(/\([^)]*\)/g, '').trim();
+              const on = picked.has(cleanT);
+              return `<button type="button" class="pill${on ? ' active' : ''}" data-cw="${esc(cleanT)}" style="font-size:12px;min-height:30px;padding:4px 9px">${esc(cleanT)}</button>`;
+            }).join('')}
+          </div>
+        ` : ''}
+        <button type="button" class="btn btn-primary btn-block" id="applyBwBtn">Собрать предложения</button>
+      `);
+
+      $('#modalSheet').querySelectorAll('[data-fm]').forEach((b) => {
+        b.onclick = () => { focus = b.dataset.fm; draw(); };
+      });
+      const bs = $('#bwSearch');
+      if (bs) {
+        bs.oninput = () => {
+          qSearch = bs.value;
+          draw();
+          const ag = $('#bwSearch');
+          if (ag) { ag.focus(); ag.setSelectionRange(ag.value.length, ag.value.length); }
+        };
+      }
+      $('#modalSheet').querySelectorAll('[data-cw]').forEach((b) => {
+        b.onclick = () => {
+          const w = b.dataset.cw;
+          if (picked.has(w)) picked.delete(w);
+          else if (picked.size < 10) picked.add(w);
+          else showToast('Максимум 10 слов за раз');
+          draw();
+        };
+      });
+      const apply = () => {
+        session.focusMode = focus;
+        session.customWords = Array.from(picked);
+        closeModal();
+        reloadBuilderQueue();
+      };
+      $('#applyBwBtn').onclick = apply;
+      $('#closeMod').onclick = closeModal;
+    }
+    draw();
+  }
+
+  function renderBuilderSession(ov) {
+    const s = session;
+    const d = window.STUDY_DATA[s.subject];
+    const pl = passedLessonFor(s.subject);
+    const topics = window.BuilderEngine.getTopics(s.subject, pl);
+
+    if (s.i >= s.queue.length) {
+      const pct = s.queue.length ? Math.round((s.ok / s.queue.length) * 100) : 0;
+      ov.innerHTML = `<div class="session-inner">
+        ${sessionHeaderHtml('Конструктор · Итог', '')}
+        <div class="card" style="text-align:center;padding:24px 18px">
+          <div class="score-big">${pct}%</div>
+          <div class="muted" style="margin-top:4px">${s.ok} из ${s.queue.length} собрано верно</div>
+          <div class="small muted" style="margin-top:8px">Граница программы: ${s.subject === 'fr' ? (pl === 0 ? 'A1' : 'A2 L' + pl) : 'Unit ' + pl}</div>
+        </div>
+        ${s.miss.length ? `
+          <div class="card">
+            <div style="font-weight:700;margin-bottom:8px">Повторить (${s.miss.length})</div>
+            ${s.miss.map((m) => `
+              <div style="padding:8px 0;border-top:1px solid var(--border)">
+                <div class="small muted">${esc(m.prompt)}</div>
+                <div style="font-weight:650;margin-top:2px">${esc(m.answer)}</div>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <button type="button" class="btn btn-primary btn-block" id="bldMoreOffline">Ещё 8 новых предложений (офлайн)</button>
+          <button type="button" class="btn btn-secondary btn-block" id="bldMoreAi">✨ Сгенерировать 5 живых фраз с ИИ</button>
+          <button type="button" class="btn btn-outline btn-block" id="bldExit">На главную</button>
+        </div>
+      </div>`;
+      bindSessionBar();
+      $('#bldMoreOffline').onclick = () => reloadBuilderQueue();
+      $('#bldMoreAi').onclick = () => triggerBuilderAiGenerate();
+      $('#bldExit').onclick = () => closeSession();
+      return;
+    }
+
+    const item = s.queue[s.i];
+    const pct = Math.round((s.i / s.queue.length) * 100);
+    const placedIds = new Set(s.placed.map((p) => p.id));
+    const focusLabel = s.focusMode === 'custom'
+      ? `Свои (${s.customWords.length})`
+      : s.focusMode === 'green'
+        ? (s.subject === 'fr' ? 'Зелёные' : 'AV')
+        : s.focusMode === 'mistakes'
+          ? 'Ошибки'
+          : 'Все слова';
+
+    ov.innerHTML = `<div class="session-inner">
+      ${sessionHeaderHtml('Конструктор', `${s.i + 1}/${s.queue.length}`)}
+      <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+
+      <!-- Compact Controls Bar -->
+      <div class="card card-compact" style="gap:8px;display:flex;flex-direction:column">
+        <div class="seg" id="bldModeSeg">
+          <button type="button" class="${s.mode === 'tiles' ? 'active' : ''}" data-bm="tiles">🧩 Плитки</button>
+          <button type="button" class="${s.mode === 'input' ? 'active' : ''}" data-bm="input">⌨️ Ввод</button>
+        </div>
+        <div class="row-gap" style="justify-content:space-between">
+          <select class="input-field" id="bldTopicSel" style="flex:1;min-width:160px;padding:7px 9px;font-size:13px">
+            <option value="">Микс пройденных правил (${topics.length})</option>
+            ${topics.map((t) => `<option value="${t.id}"${s.topicId === t.id ? ' selected' : ''}>${esc(t.label)}</option>`).join('')}
+          </select>
+          <button type="button" class="pill${s.focusMode !== 'all' ? ' active' : ''}" id="bldWordsBtn">🎯 ${esc(focusLabel)}</button>
+          <button type="button" class="ai-pill" id="bldAiGenBtn" ${s.aiBusy ? 'disabled' : ''}>${s.aiBusy ? '⏳ ИИ…' : '✨ ИИ'}</button>
+        </div>
+      </div>
+
+      <!-- Task Card -->
+      <div class="prompt-box">
+        <div class="row-between">
+          <span class="pill ${item.isAi ? 'soft-accent' : ''}" style="min-height:24px;padding:2px 9px;font-size:11.5px">${esc(item.ruleTitle)}</span>
+          ${s.checked ? `<button type="button" class="tts-btn" id="bldSpeak">${ICO.vol}</button>` : ''}
+        </div>
+        <div class="prompt-text">${esc(item.ru)}</div>
+
+        ${s.mode === 'tiles' ? `
+          <div class="tile-tray${s.placed.length ? ' filled' : ''}" id="bldTray">
+            ${s.placed.length
+              ? s.placed.map((p, pi) => `<button type="button" class="word-tile placed" data-rem="${pi}" ${s.checked ? 'disabled' : ''}>${esc(p.text)}</button>`).join('')
+              : '<span class="small muted" style="align-self:center">Нажимай на слова ниже, чтобы собрать перевод…</span>'}
+          </div>
+          <div class="tile-bank" id="bldBank">
+            ${s.bank.map((b) => `<button type="button" class="word-tile${placedIds.has(b.id) ? ' used' : ''}" data-add="${b.id}" ${s.checked || placedIds.has(b.id) ? 'disabled' : ''}>${esc(b.text)}</button>`).join('')}
+          </div>
+          ${!s.checked ? `
+            <div class="row-gap">
+              <button type="button" class="btn btn-primary" style="flex:1" id="bldCheckTiles" ${s.placed.length ? '' : 'disabled'}>Проверить</button>
+              <button type="button" class="btn btn-secondary" id="bldClearTiles" ${s.placed.length ? '' : 'disabled'}>Очистить</button>
+            </div>
+          ` : ''}
+        ` : `
+          <input type="text" class="input-field" id="bldInput" placeholder="Напечатай перевод на ${d.langLabel}..." value="${esc(s.userText)}" autocomplete="off" autocorrect="off" spellcheck="false" ${s.checked ? 'disabled' : ''}>
+          ${s.subject === 'fr' && !s.checked ? `
+            <div class="accent-bar" id="bldAccents">
+              ${FR_ACCENTS.map((ch) => `<button type="button" class="accent-key" data-ch="${esc(ch)}">${esc(ch)}</button>`).join('')}
+            </div>
+          ` : ''}
+          ${!s.checked ? `
+            <div class="row-gap">
+              <button type="button" class="btn btn-primary" style="flex:1" id="bldCheckInput">Проверить</button>
+              ${hasAiKey() ? `<button type="button" class="btn btn-secondary" id="bldAiCheckBtn" ${s.aiBusy ? 'disabled' : ''}>${s.aiBusy ? '⏳' : '✨ ИИ-проверка'}</button>` : ''}
+            </div>
+          ` : ''}
+        `}
+
+        ${s.checked ? `
+          <div class="feedback-box ${s.isCorrect ? 'good' : 'bad'}">
+            <div><b>${s.isCorrect ? 'Верно!' : 'Есть ошибка'}</b></div>
+            <div>Эталон: <b>${esc(item.answer)}</b></div>
+            ${s.aiFeedback ? `<div style="margin-top:4px">✨ <b>Разбор ИИ:</b> ${esc(s.aiFeedback.feedback)}${s.aiFeedback.better && normAnswer(s.aiFeedback.better) !== normAnswer(item.answer) ? '<br>Вариант ИИ: <b>' + esc(s.aiFeedback.better) + '</b>' : ''}</div>` : ''}
+            ${item.explain ? `<div class="small" style="margin-top:4px">${esc(item.explain)}</div>` : ''}
+          </div>
+          <div class="row-gap">
+            ${!s.isCorrect && s.mode === 'input' ? `<button type="button" class="btn btn-secondary btn-sm" id="bldOverride">Засчитать верно</button>` : ''}
+            <button type="button" class="btn btn-primary" style="flex:1" id="bldNext">${s.i + 1 < s.queue.length ? 'Дальше →' : 'К итогам'}</button>
+          </div>
+        ` : ''}
+      </div>
+    </div>`;
+
+    bindSessionBar();
+
+    // Switch tiles / input mode
+    $('#bldModeSeg').querySelectorAll('button').forEach((b) => {
+      b.onclick = () => {
+        s.mode = b.dataset.bm;
+        state.builderMode = s.mode;
+        saveState();
+        renderSession();
+      };
+    });
+
+    // Change topic filter
+    $('#bldTopicSel').onchange = (e) => {
+      s.topicId = e.target.value;
+      reloadBuilderQueue();
+    };
+
+    $('#bldWordsBtn').onclick = openBuilderWordsModal;
+    $('#bldAiGenBtn').onclick = () => triggerBuilderAiGenerate();
+
+    const sp = $('#bldSpeak');
+    if (sp) sp.onclick = () => speak(item.answer, d.lang);
+
+    if (s.mode === 'tiles' && !s.checked) {
+      ov.querySelectorAll('[data-add]').forEach((b) => {
+        b.onclick = () => {
+          const id = Number(b.dataset.add);
+          const tok = s.bank.find((x) => x.id === id);
+          if (tok && !s.placed.some((p) => p.id === id)) {
+            s.placed.push(tok);
+            renderSession();
+          }
+        };
+      });
+      ov.querySelectorAll('[data-rem]').forEach((b) => {
+        b.onclick = () => {
+          s.placed.splice(Number(b.dataset.rem), 1);
+          renderSession();
+        };
+      });
+      $('#bldClearTiles').onclick = () => { s.placed = []; renderSession(); };
+      $('#bldCheckTiles').onclick = () => {
+        const built = s.placed.map((p) => p.text).join(' ');
+        const ok = checkTypedAnswer(built, item.answer);
+        finishBuilderStep(ok, item, built);
+      };
+    } else if (s.mode === 'input' && !s.checked) {
+      const inp = $('#bldInput');
+      if (inp) {
+        inp.oninput = () => { s.userText = inp.value; };
+        inp.onkeydown = (e) => { if (e.key === 'Enter') $('#bldCheckInput').click(); };
+      }
+      const acc = $('#bldAccents');
+      if (acc) {
+        acc.querySelectorAll('button').forEach((b) => {
+          b.onclick = () => { insertAtCursor(inp, b.dataset.ch); s.userText = inp.value; };
+        });
+      }
+      $('#bldCheckInput').onclick = () => {
+        const val = (inp ? inp.value : s.userText).trim();
+        if (!val) { showToast('Введи перевод'); return; }
+        s.userText = val;
+        const ok = checkTypedAnswer(val, item.answer);
+        finishBuilderStep(ok, item, val);
+      };
+      const aiChk = $('#bldAiCheckBtn');
+      if (aiChk) {
+        aiChk.onclick = async () => {
+          const val = (inp ? inp.value : s.userText).trim();
+          if (!val) { showToast('Сначала введи свой перевод'); return; }
+          s.userText = val;
+          s.aiBusy = true;
+          renderSession();
+          try {
+            const res = await window.BuilderEngine.aiCheck({
+              aiCfg: state.ai,
+              subject: s.subject,
+              passedLesson: pl,
+              item,
+              userAnswer: val,
+            });
+            s.aiBusy = false;
+            s.aiFeedback = res;
+            finishBuilderStep(res.verdict === 'correct', item, val);
+          } catch (err) {
+            s.aiBusy = false;
+            renderSession();
+            showToast(err.message || 'Ошибка ИИ-проверки');
+          }
+        };
+      }
+    }
+
+    if (s.checked) {
+      const ovr = $('#bldOverride');
+      if (ovr) ovr.onclick = () => {
+        if (!s.isCorrect) {
+          s.isCorrect = true;
+          s.ok++;
+          s.miss = s.miss.filter((m) => m.answer !== item.answer);
+          removeMistake(s.subject, 'bld:' + item.answer);
+          renderSession();
+        }
+      };
+      $('#bldNext').onclick = () => {
+        s.i++;
+        s.checked = false;
+        s.isCorrect = false;
+        s.placed = [];
+        s.userText = '';
+        s.aiFeedback = null;
+        if (s.i < s.queue.length) {
+          s.bank = prepareTileBank(s.queue[s.i]);
+        }
+        renderSession();
+      };
+    }
+  }
+
+  function finishBuilderStep(ok, item) {
+    session.checked = true;
+    session.isCorrect = ok;
+    markActiveToday();
+    if (ok) {
+      session.ok++;
+      removeMistake(session.subject, 'bld:' + item.answer);
+    } else {
+      session.miss.push({ prompt: item.ru, answer: item.answer });
+      addMistake(session.subject, {
+        key: 'bld:' + item.answer,
+        kind: 'builder',
+        prompt: item.ru,
+        answer: item.answer,
+        ru: item.ru,
+        explain: item.explain || item.ruleTitle,
+      });
+    }
+    renderSession();
+  }
+
+  async function triggerBuilderAiGenerate() {
+    if (!session || session.type !== 'builder') return;
+    if (!hasAiKey()) {
+      openModal(`
+        <div class="modal-head">
+          <h3 class="modal-title">✨ ИИ-репетитор не подключён</h3>
+          <button type="button" class="btn btn-secondary btn-sm" id="closeMod">Закрыть</button>
+        </div>
+        <div class="small muted">Сейчас конструктор работает в быстром <b>офлайн-режиме</b>. Если хочешь дополнительно генерировать бесконечные живые фразы через DeepSeek / OpenRouter / Gemini — вставь API-ключ в Настройках.</div>
+        <button type="button" class="btn btn-primary btn-block" id="goAiSettings">Открыть настройки ИИ</button>
+      `);
+      $('#closeMod').onclick = closeModal;
+      $('#goAiSettings').onclick = () => { closeModal(true); openSettingsModal(); };
+      return;
+    }
+    const s = session;
+    const pl = passedLessonFor(s.subject);
+    const topics = window.BuilderEngine.getTopics(s.subject, pl);
+    const topObj = topics.find((t) => t.id === s.topicId);
+    const words = getBuilderTargetWords(s.focusMode, s.customWords);
+    const sampleVocab = words.length ? words : shuffle(filteredCards(s.subject)).slice(0, 10).map((c) => c.term.replace(/\([^)]*\)/g, '').trim());
+
+    s.aiBusy = true;
+    renderSession();
+    try {
+      const items = await window.BuilderEngine.aiGenerate({
+        aiCfg: state.ai,
+        subject: s.subject,
+        passedLesson: pl,
+        topicTitle: topObj ? topObj.title : '',
+        targetWords: sampleVocab,
+        count: 5,
+      });
+      s.aiBusy = false;
+      reloadBuilderQueue(items);
+      showToast(`ИИ собрал ${items.length} свежих фраз ✨`);
+    } catch (err) {
+      s.aiBusy = false;
+      renderSession();
+      showToast(err.message || 'Не удалось связаться с ИИ');
+    }
+  }
+
   function renderSession() {
     if (!session) return;
     const ov = $('#sessionOverlay');
@@ -2531,6 +3414,7 @@
     else if (session.type === 'fr_texts') renderFrTextsSession(ov);
     else if (session.type === 'econ_maps') renderEconMapsSession(ov);
     else if (session.type === 'komkor_cliches') renderKomkorClichesSession(ov);
+    else if (session.type === 'builder') renderBuilderSession(ov);
   }
 
   // ============================================================================

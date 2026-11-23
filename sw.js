@@ -1,8 +1,9 @@
-const CACHE_NAME = 'linguaprep-v1';
+const CACHE_NAME = 'linguaprep-v2';
 const ASSETS = [
   './',
   './index.html',
   './styles.css',
+  './builder_engine.js',
   './app.js',
   './manifest.json',
   './icons/icon-192.png',
