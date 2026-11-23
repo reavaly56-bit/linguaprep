@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#F4F6F9" id="metaTheme">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>LinguaPrep · МГИМО</title>
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" type="image/png" href="./icons/icon-192.png">
+  <link rel="apple-touch-icon" href="./icons/icon-192.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- Top Header -->
+    <header class="topbar" id="mainHeader">
+      <div class="topbar-left">
+        <div class="eyebrow"><span class="subject-dot" id="headerDot"></span><span id="headerSub">Accent français A1–A2</span></div>
+        <h1 class="topbar-title" id="headerTitle">Французский</h1>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" class="icon-btn" id="themeBtn" aria-label="Сменить тему" title="Тема"></button>
+        <button type="button" class="icon-btn" id="settingsBtn" aria-label="Настройки" title="Настройки"></button>
+      </div>
+    </header>
+
+    <!-- Subject Switcher Rail -->
+    <nav class="subject-rail" id="subjectRail" aria-label="Направления"></nav>
+
+    <!-- Main Scrollable Viewport -->
+    <main class="main-view" id="mainView"></main>
+
+    <!-- Bottom Tab Navigation (3 clean tabs) -->
+    <nav class="bottom-nav" id="bottomNav" aria-label="Разделы">
+      <button type="button" class="nav-tab" data-tab="learn" aria-current="page">
+        <span class="nav-ico" id="icoLearn"></span>
+        <span>Учить</span>
+      </button>
+      <button type="button" class="nav-tab" data-tab="cheat">
+        <span class="nav-ico" id="icoCheat"></span>
+        <span>Шпаргалка</span>
+      </button>
+      <button type="button" class="nav-tab" data-tab="progress">
+        <span class="nav-ico" id="icoProgress"></span>
+        <span>Прогресс</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Full-Screen Active Study Session Overlay -->
+  <div id="sessionOverlay" class="session-overlay" hidden></div>
+
+  <!-- Clean Modal / Bottom Sheet Container -->
+  <div id="modalBackdrop" class="modal-backdrop" hidden>
+    <div id="modalSheet" class="modal-sheet" role="dialog" aria-modal="true"></div>
+  </div>
+
+  <!-- Subtle Floating Toast -->
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <!-- Modular Offline Datasets -->
+  <script src="./data/fr.js"></script>
+  <script src="./data/en.js"></script>
+  <script src="./data/econ.js"></script>
+  <script src="./data/komkor.js"></script>
+  <script src="./data/hr.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

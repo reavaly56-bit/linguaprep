@@ -1,0 +1,24 @@
+{
+  "name": "LinguaPrep — МГИМО",
+  "short_name": "LinguaPrep",
+  "description": "Единый тренажёр по языкам МГИМО: Французский A1–A2, General English, Эконом. перевод, Комкор, Home Reading",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#F4F6F9",
+  "theme_color": "#111827",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
