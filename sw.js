@@ -1,4 +1,4 @@
-const CACHE_NAME = 'linguaprep-v2';
+const CACHE_NAME = 'linguaprep-v3';
 const ASSETS = [
   './',
   './index.html',

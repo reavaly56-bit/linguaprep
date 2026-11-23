@@ -63,6 +63,7 @@
       frPassedLesson: 5, // Passed up to A2 Lesson 5 (strict program barrier!)
       enPassedLesson: 3, // Passed up to Unit 3
       wakeLock: true,
+      ttsMode: 'auto', // 'auto' (live voice + offline cache + system fallback) | 'system' (offline system TTS only)
       selectedUnits: sel,
       srs: {},          // cardId -> { box: 0..4, due: 'YYYY-MM-DD', seen: n }
       mistakes: {},     // subject -> [ { key, kind, prompt, answer, ru, explain } ]
@@ -158,7 +159,12 @@
       .trim();
     const spoken = clean || String(text);
     const targetLang = lang || curData().lang || 'en-GB';
-    if (window.AndroidBridge && typeof window.AndroidBridge.speak === 'function') {
+    if (window.AndroidBridge && typeof window.AndroidBridge.speakWithMode === 'function') {
+      try {
+        window.AndroidBridge.speakWithMode(spoken, targetLang, state.ttsMode || 'auto');
+        return;
+      } catch {}
+    } else if (window.AndroidBridge && typeof window.AndroidBridge.speak === 'function') {
       try {
         window.AndroidBridge.speak(spoken, targetLang);
         return;
@@ -558,12 +564,13 @@
 
     // Hybrid Sentence Builder card (FR & General EN)
     const builderTopics = window.BuilderEngine ? window.BuilderEngine.getTopics(state.subject, passedLessonFor()) : [];
+    const builderEst = window.BuilderEngine && window.BuilderEngine.estimateCount ? window.BuilderEngine.estimateCount(state.subject, passedLessonFor()) : 0;
     const builderModeHtml = builderTopics.length ? `
       <button type="button" class="mode-row" data-mode="builder">
         <div class="mode-icon accent">${ICO.wand}</div>
         <div class="mode-body">
           <div class="mode-title">Конструктор предложений ${hasAiKey() ? '<span class="ai-pill" style="padding:1px 7px;font-size:10.5px;margin-left:4px">✨ ИИ</span>' : ''}</div>
-          <div class="mode-desc">Плитки и ввод строго до ${bInfo ? esc(bInfo.cur.label) : 'текущего урока'} · офлайн${hasAiKey() ? ' + онлайн ИИ' : ' (+ опция ИИ)'}</div>
+          <div class="mode-desc">~${builderEst.toLocaleString('ru-RU')}+ фраз офлайн до ${bInfo ? esc(bInfo.cur.label) : 'текущего урока'} · плитки, ввод${hasAiKey() ? ' + ИИ' : ' (+ опция ИИ)'}</div>
         </div>
         <div class="mode-right">${builderTopics.length} тем ${ICO.chev}</div>
       </button>
@@ -1265,6 +1272,17 @@
           <button type="button" class="pill${state.wakeLock ? ' active' : ''}" id="setWake">${state.wakeLock ? 'Вкл' : 'Выкл'}</button>
         </div>
 
+        <div class="setting-row">
+          <div>
+            <b>Озвучка (голос)</b>
+            <div class="small muted">Живой голос с автокэшем работает на Huawei для FR и EN без Google-пакетов</div>
+          </div>
+          <select class="input-field" id="setTtsMode" style="width:136px;padding:8px;font-size:13px">
+            <option value="auto"${(state.ttsMode || 'auto') === 'auto' ? ' selected' : ''}>Живой + кэш</option>
+            <option value="system"${state.ttsMode === 'system' ? ' selected' : ''}>Системный</option>
+          </select>
+        </div>
+
         <!-- Hybrid AI Tutor Config -->
         <div class="ai-box" style="margin:10px 0">
           <div class="row-between">
@@ -1331,6 +1349,12 @@
       state.wakeLock = !state.wakeLock;
       saveState();
       openSettingsModal();
+    };
+    const stts = $('#setTtsMode');
+    if (stts) stts.onchange = (e) => {
+      state.ttsMode = e.target.value;
+      saveState();
+      showToast(state.ttsMode === 'auto' ? 'Озвучка: живой голос + офлайн-кэш' : 'Озвучка: только системный голос');
     };
     $('#aiPreset').onchange = (e) => {
       const p = presets[e.target.value];
