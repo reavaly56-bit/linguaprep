@@ -121,33 +121,44 @@
     toastTimer = setTimeout(() => { el.hidden = true; }, 2200);
   }
 
-  // Wake Lock API
+  // Wake Lock API (+ native AndroidBridge fallback)
   async function acquireWakeLock() {
-    if (!state.wakeLock || !('wakeLock' in navigator)) return;
+    if (!state.wakeLock) return;
+    try { window.AndroidBridge?.setKeepScreenOn?.(true); } catch {}
+    if (!('wakeLock' in navigator)) return;
     try { wakeLockSentinel = await navigator.wakeLock.request('screen'); } catch {}
   }
   function releaseWakeLock() {
+    try { window.AndroidBridge?.setKeepScreenOn?.(false); } catch {}
     if (wakeLockSentinel) {
       try { wakeLockSentinel.release(); } catch {}
       wakeLockSentinel = null;
     }
   }
 
-  // TTS Audio
+  // TTS Audio (native Android TextToSpeech in APK, Web Speech API in browser)
   function speak(text, lang) {
+    const clean = String(text)
+      .replace(/\([^)]*\)/g, '')
+      .replace(/\b(qch|qn|sth|sb|smb)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const spoken = clean || String(text);
+    const targetLang = lang || curData().lang || 'en-GB';
+    if (window.AndroidBridge && typeof window.AndroidBridge.speak === 'function') {
+      try {
+        window.AndroidBridge.speak(spoken, targetLang);
+        return;
+      } catch {}
+    }
     if (!('speechSynthesis' in window)) {
-      showToast('Озвучка не поддерживается браузером');
+      showToast('Озвучка не поддерживается устройством');
       return;
     }
     try {
       window.speechSynthesis.cancel();
-      const clean = String(text)
-        .replace(/\([^)]*\)/g, '')
-        .replace(/\b(qch|qn|sth|sb|smb)\b/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const u = new SpeechSynthesisUtterance(clean || text);
-      u.lang = lang || curData().lang || 'en-GB';
+      const u = new SpeechSynthesisUtterance(spoken);
+      u.lang = targetLang;
       u.rate = 0.94;
       window.speechSynthesis.speak(u);
     } catch {
@@ -161,6 +172,7 @@
     $('#themeBtn').innerHTML = state.theme === 'dark' ? ICO.sun : ICO.moon;
     const meta = $('#metaTheme');
     if (meta) meta.content = state.theme === 'dark' ? '#0B0E14' : '#F4F6F9';
+    try { window.AndroidBridge?.setTheme?.(state.theme === 'dark'); } catch {}
   }
 
   // Current subject helpers
@@ -962,11 +974,17 @@
       openSettingsModal();
     };
     $('#exportBtn').onclick = () => {
-      const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+      const json = JSON.stringify(state, null, 2);
+      const fname = `linguaprep-backup-${todayStr()}.json`;
+      if (window.AndroidBridge && typeof window.AndroidBridge.saveBackup === 'function') {
+        window.AndroidBridge.saveBackup(json, fname);
+        return;
+      }
+      const blob = new Blob([json], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `linguaprep-backup-${todayStr()}.json`;
+      a.download = fname;
       a.click();
       URL.revokeObjectURL(url);
       showToast('Бэкап скачан');
@@ -1050,6 +1068,7 @@
     clearInterval(timerId);
     timerId = null;
     releaseWakeLock();
+    try { window.AndroidBridge?.stopSpeak?.(); } catch {}
     session = null;
     $('#sessionOverlay').hidden = true;
     $('#sessionOverlay').innerHTML = '';
@@ -1070,6 +1089,24 @@
       closeSession(true);
     }
   });
+
+  // Native Android Back button hook
+  window.__appBack = function () {
+    if (!$('#modalBackdrop').hidden) {
+      closeModal();
+      return true;
+    }
+    if (session) {
+      closeSession();
+      return true;
+    }
+    if (state.tab !== 'learn') {
+      state.tab = 'learn';
+      renderAll();
+      return true;
+    }
+    return false;
+  };
 
   function sessionHeaderHtml(title, progressText, canUndo = false, timerText = '') {
     return `
@@ -2521,7 +2558,7 @@
   });
 
   // Register Service Worker for offline PWA
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http') && !window.AndroidBridge) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
